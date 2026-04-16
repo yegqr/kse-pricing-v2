@@ -42,7 +42,7 @@ def apply_filters(df, years_sel, included_uni_substrings):
     return df
 
 
-def run_model(df, MC, kse_year, n_boot):
+def run_model(df, MC, kse_year, n_boot, rho_year_only=False):
     kse_all  = df[df["університет_назва"].str.contains("Київська школа")].copy()
     peer_all = df[~df["університет_назва"].str.contains("Київська школа")].copy()
 
@@ -50,7 +50,9 @@ def run_model(df, MC, kse_year, n_boot):
     boot_betas = bootstrap_beta1(df, spec_cols, n_boot=n_boot)
     b10, b50, b90 = np.percentile(boot_betas, [10, 50, 90])
 
-    rho_by_spec, overall_rho = compute_rho_cascade(kse_all)
+    rho_by_spec, overall_rho = compute_rho_cascade(kse_all, kse_year=kse_year, year_only=rho_year_only)
+
+
 
     hist_fp = {}
     for prog, grp in kse_all.groupby("освітня_програма"):
@@ -159,6 +161,12 @@ with st.sidebar:
     st.caption(f"= {mc_uah:,.0f} грн  (× {UAH_PER_USD} UAH/$)")
     kse_year = st.selectbox("Рік KSE для оптимізації", [2025, 2024, 2023])
     n_boot   = st.slider("Bootstrap ітерацій", 200, 2000, 500, 100)
+    rho_year_only = st.checkbox(
+        f"ρ тільки з {kse_year} року",
+        value=False,
+        help="Вимк. (default) = ρ по всіх роках KSE — консервативно. "
+             "Увімк. = ρ тільки з цільового року — відображає реальну конверсію того сезону."
+    )
 
     st.markdown("---")
     st.markdown("### 🗓 Роки у вибірці")
@@ -180,7 +188,8 @@ with st.sidebar:
 
 st.markdown("# KSE Pricing Optimizer")
 st.markdown("<p style='color:#6b7280;margin-top:-12px;font-size:14px;'>"
-            "OLS demand estimation · anchored profit-max · bootstrap CI</p>",
+            "OLS demand estimation · anchored profit-max · bootstrap CI"
+            " · <b style='color:#2563eb'>рекомендації для вступної кампанії 2026</b></p>",
             unsafe_allow_html=True)
 
 if not uploaded and not os.path.exists(DEFAULT_CSV):
@@ -212,7 +221,7 @@ with st.spinner("Завантаження та очищення даних..."):
     )
 
 with st.spinner(f"Регресія + bootstrap ({n_boot} ітерацій)..."):
-    results, reg = run_model(df, mc_uah, kse_year, n_boot)
+    results, reg = run_model(df, mc_uah, kse_year, n_boot, rho_year_only)
 
 if results is None:
     st.error(f"Немає KSE-програм для {kse_year} у відфільтрованих даних.")
@@ -276,6 +285,7 @@ def _style(df):
             }, na_rep="—"))
 
 st.dataframe(_style(df_res), use_container_width=True, height=370)
+st.caption("⚠️ p_opt_k — рекомендована ціна для прайсу вступної кампанії 2026, вже у цінах 2026. Ставити напряму — без додаткової індексації.")
 
 s1, s2, s3 = st.columns(3)
 base_total = sum(r["profit_base_M"] for r in results)
@@ -284,7 +294,7 @@ delta_vf   = (opt_total / fact_total - 1) * 100 if fact_total else 0
 for col, lbl, val, sub in [
     (s1, f"Факт {kse_year}",   f"{fact_total:.2f}M грн", "(p_cur − MC) × fp_факт"),
     (s2, "Модельний baseline",  f"{base_total:.2f}M грн", "(p_cur − MC) × apps × ρ_avg ← занижено"),
-    (s3, "Оптимум (PUBLISH)",   f"{opt_total:.2f}M грн",  f"vs факт: {delta_vf:+.1f}%"),
+    (s3, "Оптимум (PUBLISH)",   f"{opt_total:.2f}M грн",  f"прайс 2026 · vs факт: {delta_vf:+.1f}%"),
 ]:
     col.markdown(f'<div class="mc"><div class="mc-label">{lbl}</div>'
                  f'<div class="mc-val">{val}</div>'
@@ -304,11 +314,11 @@ COL_DEFS = [
     ("p_факт_k",      "Номінальна ціна, тис. грн",
      "Реальна ціна у прайсі KSE. Без жодних коригувань.",
      "вартість_мін_грн / 1 000"),
-    ("p_cur_k",       "CPI-приведена ціна → 2026, тис. грн",
-     f"p_факт × CPI-множник конкретного року. {cpi_note}.",
+    ("p_cur_k",       "Ціна приведена до гривень 2026, тис. грн",
+     f"p_факт × CPI-множник. Це 'поточна' ціна в єдиних цінах 2026 — від неї рахується Δp%. {cpi_note}.",
      "p_факт × CPI(year→2026)"),
-    ("p_opt_k",       "Рекомендована ціна 2026, тис. грн",
-     "Ціна що максимізує (p − MC) × fullpay(p). Вже у цінах 2026 — більше не індексувати.",
+    ("p_opt_k",       "Рекомендована ціна для прайсу 2026, тис. грн",
+     "Ціна що максимізує (p − MC) × fullpay(p). Вже у цінах 2026 — ставити у прайс напряму, без додаткової індексації.",
      "argmax_p [(p − MC) · apps(p) · ρ]"),
     ("Δp%",           "Зміна ціни відносно p_cur",
      "На скільки % оптимальна ціна відрізняється від CPI-приведеної поточної.",
@@ -437,9 +447,9 @@ STEPS = [
      "Двоетапний маппінг: спочатку освітня_програма, потім спеціальність — щоб AUK 'Бізнес-адміністрування' "
      "потрапила в ту ж group що і KSE 'Бізнес-економіка'.",
      r"\text{spec\_group} = \text{SPEC\_MAP}[\text{освітня\_програма}] \;\text{ або }\; \text{SPEC\_MAP}[\text{спеціальність}]"),
-    ("03", "OLS з spec FE та HC3 SE",
-     "Оцінюємо β₁ по всьому peer-ринку одночасно. Spec fixed effects прибирають 'бренд спеціальності' "
-     "як середній рівень попиту — без цього медицина б порівнювалась з фізикою. "
+    ("03", "OLS з spec dummies та HC3 SE",
+     "Оцінюємо β₁ по всьому peer-ринку одночасно. Spec dummies прибирають 'бренд спеціальності' "
+     "як середній рівень попиту — без цього медицина б порівнювалась з фізикою. "   
      "HC3 стандартні помилки коригують гетероскедастичність (дисперсія залишків різна між програмами).",
      r"\text{apps}_{it} = \beta_0 + \beta_1 p_{it} + \beta_2 \text{priority}_{it} + \beta_3 \text{score}_{it} + \sum_k \gamma_k \mathbf{1}[\text{spec}=k] + u_{it}"),
     ("04", "Локальна еластичність у точці KSE",
@@ -447,19 +457,23 @@ STEPS = [
      "Ключове слово ЛОКАЛЬНА: це дотична до кривої в поточній точці, не властивість всієї кривої.",
      r"\varepsilon = \beta_1 \cdot \frac{p_{cur}}{apps_{cur}}"),
     ("05", "Anchored demand curve",
-     "Криву попиту не відновлюємо глобально — це дало б нереалістичні числа для малих програм. "
-     "Беремо реальну точку KSE і рухаємось вздовж оціненого нахилу. "
-     "Це переводить модель з 'глобальний ринковий прогноз' у 'локальний price gradient навколо KSE 2025'.",
+     f"Криву попиту не відновлюємо глобально — це дало б нереалістичні числа для малих програм. "
+     f"Беремо реальну точку KSE {kse_year} і рухаємось вздовж оціненого нахилу. "
+     f"Результат: локальний прогноз зміни попиту навколо поточної точки → рекомендована ціна для 2026.",
      r"\text{apps}(p) = \max\!\bigl(apps_{cur} + \beta_1 (p - p_{cur}),\ 0\bigr)"),
     ("06", "Конверсія заяв → платники через ρ",
-     "ρ = середня конверсія заяв у платників по всіх роках KSE для spec_group. "
-     "Важливо: ρ_all_years < ρ_2025 бо 2025 рік KSE мав аномально високу конверсію. "
-     "Це занижує модельний baseline, але робить його більш консервативним.",
+     (f"ρ = конверсія заяв у платників ТІЛЬКИ З {kse_year} РОКУ. "
+      f"Відображає реальну воронку того сезону — більш оптимістична оцінка."
+      if rho_year_only else
+      "ρ = середня конверсія заяв у платників по ВСІХ РОКАХ KSE для spec_group. "
+      "Консервативна оцінка: не залежить від аномалій одного року. "
+      "Щоб використати ρ тільки з цільового року — увімкніть галочку в sidebar."),
      r"\rho = \frac{\sum_t \text{fullpay}_t}{\sum_t \text{apps}_t}, \qquad \text{fullpay}(p) = \text{apps}(p) \cdot \rho"),
     ("07", "Оптимізація profit (grid search + Lerner)",
      "Максимізуємо gross profit. Grid 3000 точок від 0.75×p_cur до 1.6×p_cur. "
      "Якщо p* потрапляє в межах 5% від краю гриду — статус SKIP (edge hit): "
-     "лінійна екстраполяція на ±60% від поточної точки не є надійною.",
+     "лінійна екстраполяція на ±60% від поточної точки не є надійною. "
+     "p* виражений у гривнях 2026 — це і є ціна яку треба поставити у прайс вступної кампанії 2026. Більше не індексувати.",
      r"\pi(p) = (p - MC) \cdot \text{fullpay}(p), \qquad p^*_{\text{Lerner}} = \frac{p_{cur}+MC}{2} + \frac{apps_{cur}}{2|\beta_1|}"),
     ("08", f"Bootstrap невизначеності ({n_boot} ітерацій)",
      f"1000 resample панелю → переоцінюємо β₁ → збираємо розподіл p*. "
@@ -505,26 +519,26 @@ for r in results:
 
 | | тис. грн |
 |---|---|
-| Факт {kse_year} | **{r['p_fact_k']}k** |
-| CPI → 2026 | **{r['p_cur_k']}k** |
-| Оптимум p* | **{r['p_opt_k']}k** ({r['delta_p_pct']:+.1f}%) |
+| Факт {kse_year} (прайс) | **{r['p_fact_k']}k** |
+| Приведено до цін 2026 | **{r['p_cur_k']}k** |
+| Рекомендована ціна 2026 (p*) | **{r['p_opt_k']}k** ({r['delta_p_pct']:+.1f}%) ← ставити у прайс |
 | Bootstrap CI | [{r['ci10_k']}k – {r['ci90_k']}k] — CI_width {r['ci_width_pct']:.1f}% ({ci_c}) |
 | Lerner-check | {r['p_lerner_k']}k |
 
 **Платники (fullpay)**
 
-{hist_str} → [прогноз p*: **{r['fp_opt']}**]
+{hist_str} → [прогноз при p* 2026: **{r['fp_opt']}**]
 
 **Прибуток**
 
 | | M грн |
 |---|---|
 | Факт {kse_year} | {r['profit_fact_M']:.3f}M |
-| При p* (оптимум) | **{r['profit_opt_M']:.3f}M** |
+| При p* 2026 (оптимум) | **{r['profit_opt_M']:.3f}M** |
 | Δ vs факт | **{r['delta_profit_vs_fact']:+.1f}%** |
 
 **ε_попит = {r['eps']}** — {eps_c}  
-**ρ = {r['rho_allyears']}** — конверсія заяв у платників (all-years KSE)
+**ρ = {r['rho_allyears']}** — конверсія заяв у платників ({'тільки ' + str(kse_year) if rho_year_only else 'all-years KSE'})
 """, unsafe_allow_html=True)
 
 

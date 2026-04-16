@@ -268,15 +268,17 @@ def bootstrap_beta1(df: pd.DataFrame, spec_cols: list, n_boot: int = N_BOOT) -> 
 # 4. ρ — КАСКАДНЕ ОБЧИСЛЕННЯ (all-years KSE)
 # ─────────────────────────────────────────────
 
-def compute_rho_cascade(kse_all: pd.DataFrame) -> dict:
+def compute_rho_cascade(kse_all: pd.DataFrame, kse_year: int = 2025, year_only: bool = False) -> dict:
     """
-    Повертає словник spec_group → ρ_all_years.
-    Каскад: program-level → spec-level → overall.
+    year_only=False (default): ρ по всіх роках KSE — консервативна оцінка.
+    year_only=True:            ρ тільки з kse_year — реальна конверсія того сезону.
     """
-    overall_rho = kse_all["fullpay"].sum() / kse_all["apps"].sum()
+    source = kse_all[kse_all["рік"] == kse_year] if year_only else kse_all
+
+    overall_rho = source["fullpay"].sum() / source["apps"].sum()
 
     rho_by_spec = {}
-    for spec, grp in kse_all.groupby("spec_group"):
+    for spec, grp in source.groupby("spec_group"):
         if grp["apps"].sum() > 0:
             rho_by_spec[spec] = grp["fullpay"].sum() / grp["apps"].sum()
         else:
@@ -498,7 +500,10 @@ def main():
     print(f"  Bootstrap β₁: [{b10:.7f},  {b90:.7f}]  (median={b50:.7f})")
 
     # 4. ρ (all-years KSE)
-    rho_by_spec, overall_rho = compute_rho_cascade(kse_all)
+    rho_by_spec, overall_rho = compute_rho_cascade(kse_all, kse_year=args.kse_year, year_only=False)
+
+
+
 
     print(f"\n── ρ ALL-YEARS KSE ───────────────────────────────────────────")
     for s, r in sorted(rho_by_spec.items()):
