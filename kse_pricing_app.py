@@ -264,8 +264,8 @@ def _style(df):
         if pd.isna(v): return ""
         return "color:#16a34a;font-weight:600" if v > 0 else "color:#dc2626;font-weight:600"
     return (df.style
-            .applymap(col_status, subset=["status"])
-            .applymap(col_num, subset=["Δp%", "Δprofit%_факт"])
+            .map(col_status, subset=["status"])
+            .map(col_num, subset=["Δp%", "Δprofit%_факт"])
             .format({
                 "p_факт_k": "{:.1f}k", "p_cur_k": "{:.1f}k", "p_opt_k": "{:.1f}k",
                 "CI_p10": "{:.1f}k",   "CI_p90": "{:.1f}k",
