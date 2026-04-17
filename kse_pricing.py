@@ -206,56 +206,78 @@ def load_and_clean(csv_path: str) -> pd.DataFrame:
 # 2. ГЛОБАЛЬНА OLS З SPEC FE
 # ─────────────────────────────────────────────
 
-def fit_global_ols(df: pd.DataFrame):
+def fit_global_ols(df: pd.DataFrame, nonlinear: bool = False):
+    """
+    nonlinear=False: лінійна специфікація  apps ~ price + controls + spec_FE
+    nonlinear=True:  log-log специфікація  log(apps) ~ log(price) + controls + spec_FE
+                     β₁ = константна еластичність попиту
+    """
     spec_dummies = pd.get_dummies(
         df["spec_group"], drop_first=True, prefix="s"
     ).astype(float)
     spec_cols = spec_dummies.columns.tolist()
 
+    if nonlinear:
+        price_col = np.log(df["price_2026"].clip(lower=1))
+        y         = np.log(df["apps"].clip(lower=1))
+        param_key = "log_price"
+    else:
+        price_col = df["price_2026"]
+        y         = df["apps"]
+        param_key = "price_2026"
+
+    price_series = pd.Series(price_col.values, index=df.index, name=param_key)
+
     X = pd.concat(
-        [df["price_2026"], df["середній_пріоритет"], df["рейт_бал_контракт"], spec_dummies],
+        [price_series, df["середній_пріоритет"], df["рейт_бал_контракт"], spec_dummies],
         axis=1,
     )
     X = sm.add_constant(X)
-    y = df["apps"]
 
     model = sm.OLS(y, X).fit(cov_type="HC3")
 
     # Breusch–Pagan
     bp_lm, bp_pval, _, _ = het_breuschpagan(model.resid, model.model.exog)
 
-    # VIF (тільки числові регресори без дамм і константи)
-    vif_cols = ["price_2026", "середній_пріоритет", "рейт_бал_контракт"]
-    vif_X = sm.add_constant(df[vif_cols]).values
-    vif_vals = [variance_inflation_factor(vif_X, i) for i in range(1, len(vif_cols) + 1)]
+    # VIF
+    vif_cols = [param_key, "середній_пріоритет", "рейт_бал_контракт"]
+    vif_X = sm.add_constant(df[["price_2026", "середній_пріоритет", "рейт_бал_контракт"]]).values
+    vif_vals = [variance_inflation_factor(vif_X, i) for i in range(1, 4)]
     max_vif = max(vif_vals)
 
-    return model, model.params["price_2026"], spec_cols, bp_pval, max_vif
+    return model, model.params[param_key], spec_cols, bp_pval, max_vif
 
 
 # ─────────────────────────────────────────────
 # 3. BOOTSTRAP β₁
 # ─────────────────────────────────────────────
 
-def bootstrap_beta1(df: pd.DataFrame, spec_cols: list, n_boot: int = N_BOOT) -> np.ndarray:
+def bootstrap_beta1(df: pd.DataFrame, spec_cols: list, n_boot: int = N_BOOT, nonlinear: bool = False) -> np.ndarray:
     np.random.seed(SEED)
     betas = []
     n = len(df)
+    param_key = "log_price" if nonlinear else "price_2026"
 
     for _ in range(n_boot):
-        idx = np.random.choice(n, n, replace=True)
+        idx  = np.random.choice(n, n, replace=True)
         dfsb = df.iloc[idx].copy()
-        sd = pd.get_dummies(dfsb["spec_group"], drop_first=True, prefix="s").astype(float)
+        sd   = pd.get_dummies(dfsb["spec_group"], drop_first=True, prefix="s").astype(float)
         for c in spec_cols:
             if c not in sd.columns:
                 sd[c] = 0.0
-        Xb = pd.concat(
-            [dfsb["price_2026"], dfsb["середній_пріоритет"], dfsb["рейт_бал_контракт"], sd[spec_cols]],
-            axis=1,
-        )
+
+        if nonlinear:
+            price_s = pd.Series(np.log(dfsb["price_2026"].clip(lower=1).values),
+                                index=dfsb.index, name="log_price")
+            y_b = np.log(dfsb["apps"].clip(lower=1))
+        else:
+            price_s = dfsb["price_2026"].rename("price_2026")
+            y_b = dfsb["apps"]
+
+        Xb = pd.concat([price_s, dfsb["середній_пріоритет"], dfsb["рейт_бал_контракт"], sd[spec_cols]], axis=1)
         Xb = sm.add_constant(Xb)
         try:
-            b = sm.OLS(dfsb["apps"], Xb).fit().params.get("price_2026", np.nan)
+            b = sm.OLS(y_b, Xb).fit().params.get(param_key, np.nan)
             if pd.notna(b) and b < 0:
                 betas.append(b)
         except Exception:
@@ -286,7 +308,6 @@ def compute_rho_cascade(kse_all: pd.DataFrame, kse_year: int = 2025, year_only: 
 
     return rho_by_spec, overall_rho
 
-
 # ─────────────────────────────────────────────
 # 5. ОПТИМІЗАЦІЯ ПО ПРОГРАМІ
 # ─────────────────────────────────────────────
@@ -299,45 +320,57 @@ def optimize_program(
     MC: float,
     peer_rows: int,
     peer_unis: int,
+    nonlinear: bool = False,
 ) -> dict:
-    p_cur    = row["price_2026"]
-    p_fact   = row["вартість_мін_грн"]          # номінальна ціна 2025 без CPI
-    apps_cur = row["apps"]
-    fp_actual_2025 = row["fullpay"]   # фактичний 2025, тільки як контекст
+    p_cur          = row["price_2026"]
+    p_fact         = row["вартість_мін_грн"]
+    apps_cur       = row["apps"]
+    fp_actual_2025 = row["fullpay"]
 
-    # Profit-функції (model-consistent: однаковий ρ для baseline і оптимуму)
     grid = np.linspace(max(p_cur * 0.75, MC + 5_000), p_cur * 1.6, GRID_N)
 
-    def _profit(p_arr):
-        apps_ = np.maximum(apps_cur + beta1 * (p_arr - p_cur), 0)
-        return (p_arr - MC) * apps_ * rho
+    if nonlinear:
+        # Log-log: apps(p) = apps_cur * (p/p_cur)^β₁  (constant elasticity)
+        def _apps(p_arr):
+            return np.maximum(apps_cur * (p_arr / p_cur) ** beta1, 0)
+        def _profit(p_arr):
+            return (p_arr - MC) * _apps(p_arr) * rho
+        # Lerner для constant-elasticity: p* = MC·ε/(ε+1), валідно лише при ε < -1
+        if beta1 < -1:
+            p_lerner = MC * beta1 / (beta1 + 1)
+        else:
+            p_lerner = float("nan")  # нееластичний → p* → ∞, обмежуємо гридом
+        # apps_opt через степеневу функцію
+        def _apps_at(p): return float(np.maximum(apps_cur * (p / p_cur) ** beta1, 0))
+    else:
+        # Лінійна: apps(p) = apps_cur + β₁·(p - p_cur)
+        def _profit(p_arr):
+            apps_ = np.maximum(apps_cur + beta1 * (p_arr - p_cur), 0)
+            return (p_arr - MC) * apps_ * rho
+        p_lerner = (p_cur + MC) / 2 + apps_cur / (2 * abs(beta1))
+        def _apps_at(p): return float(np.maximum(apps_cur + beta1 * (p - p_cur), 0))
 
     profit_grid = _profit(grid)
     idx_opt     = np.argmax(profit_grid)
     p_opt       = grid[idx_opt]
     profit_opt  = profit_grid[idx_opt]
-    profit_base = _profit(np.array([p_cur]))[0]   # model-consistent baseline
+    profit_base = _profit(np.array([p_cur]))[0]
 
-    # Аналітична перевірка (Lerner)
-    p_lerner = (p_cur + MC) / 2 + apps_cur / (2 * abs(beta1))
-
-    # Bootstrap CI для p_opt
+    # Bootstrap CI
     p_opts_boot = []
     for b in boot_betas:
-        pg = _profit.__func__ if False else None  # inline
-        ag = np.maximum(apps_cur + b * (grid - p_cur), 0)
-        profit_b = (grid - MC) * ag * rho
+        if nonlinear:
+            profit_b = (grid - MC) * np.maximum(apps_cur * (grid / p_cur) ** b, 0) * rho
+        else:
+            profit_b = (grid - MC) * np.maximum(apps_cur + b * (grid - p_cur), 0) * rho
         p_opts_boot.append(grid[np.argmax(profit_b)])
     p_opts_boot = np.array(p_opts_boot)
     ci10, ci50, ci90 = np.percentile(p_opts_boot, [10, 50, 90])
 
-    # Прапори
-    # Edge hit: оптимум в межах 5% від краю гриду → лінійна екстраполяція вийшла за межі
-    # Абсолютний поріг 2 000 грн не ловить при великих цінах (напр. 212k vs 216k = 4k > 2k)
-    grid_range = grid[-1] - grid[0]
-    edge_hit = (abs(p_opt - grid[0]) < 0.05 * grid_range) or (abs(p_opt - grid[-1]) < 0.05 * grid_range)
+    grid_range   = grid[-1] - grid[0]
+    edge_hit     = (abs(p_opt - grid[0]) < 0.05 * grid_range) or (abs(p_opt - grid[-1]) < 0.05 * grid_range)
     ci_width_rel = (ci90 - ci10) / p_cur
-    unstable = ci_width_rel > MAX_CI_WIDTH
+    unstable     = ci_width_rel > MAX_CI_WIDTH
 
     if edge_hit:
         publish = "SKIP (edge hit)"
@@ -346,9 +379,10 @@ def optimize_program(
     else:
         publish = "PUBLISH"
 
-    # Еластичність попиту (заяв) — знаменник apps_cur, бо β₁ оцінений саме на заявах.
-    # ε_контракт = ε_заяв при константному ρ (ρ скорочується з чисельника і знаменника).
-    eps = beta1 * p_cur / apps_cur
+    # Еластичність
+    eps = beta1 if nonlinear else beta1 * p_cur / apps_cur
+
+    apps_at_opt = _apps_at(p_opt)
 
     return {
         "Програма":        row["освітня_програма"],
@@ -356,17 +390,17 @@ def optimize_program(
         "p_cur_k":         round(p_cur / 1_000, 1),
         "p_fact_k":        round(p_fact / 1_000, 1),
         "p_opt_k":         round(p_opt / 1_000, 1),
-        "p_lerner_k":      round(p_lerner / 1_000, 1),
+        "p_lerner_k":      round(p_lerner / 1_000, 1) if not np.isnan(p_lerner) else float("nan"),
         "ci10_k":          round(ci10 / 1_000, 1),
         "ci90_k":          round(ci90 / 1_000, 1),
         "delta_p_pct":     round((p_opt / p_cur - 1) * 100, 1),
         "eps":             round(eps, 2),
         "rho_allyears":    round(rho, 3),
         "apps_cur":        int(apps_cur),
-        "apps_opt":        int(round(float(np.maximum(apps_cur + beta1 * (p_opt - p_cur), 0)))),
+        "apps_opt":        int(round(apps_at_opt)),
         "fp_actual_2025":  int(fp_actual_2025),
         "fp_model_base":   round(apps_cur * rho, 1),
-        "fp_opt":          round(float(np.maximum(apps_cur + beta1 * (p_opt - p_cur), 0) * rho), 1),
+        "fp_opt":          round(apps_at_opt * rho, 1),
         "profit_base_M":   round(profit_base / 1e6, 3),
         "profit_opt_M":    round(profit_opt / 1e6, 3),
         "delta_profit_pct": round((profit_opt / profit_base - 1) * 100, 1) if profit_base > 0 else float("nan"),
@@ -500,7 +534,7 @@ def main():
     print(f"  Bootstrap β₁: [{b10:.7f},  {b90:.7f}]  (median={b50:.7f})")
 
     # 4. ρ (all-years KSE)
-    rho_by_spec, overall_rho = compute_rho_cascade(kse_all, kse_year=args.kse_year, year_only=False)
+    rho_by_spec, overall_rho = compute_rho_cascade(kse_all, kse_year=kse_year)
 
 
 
