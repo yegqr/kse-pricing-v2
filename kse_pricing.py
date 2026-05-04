@@ -191,7 +191,10 @@ def load_and_clean(csv_path: str) -> pd.DataFrame:
     # середній_пріоритет має 85/207 пропусків (~41%). Імпутація per-spec_group
     # дала б одне значення на групу → лінійна залежність від spec FE → p(β₁)=1.
     # рейт_бал_контракт: 4 пропуски, глобальна медіана безпечна.
+    # ВАЖЛИВО: зберігаємо прапор {col}_imputed, щоб у score-регресії
+    # дропати імпутовані рядки (вони зміщують β_score до 0).
     for col in ["рейт_бал_контракт", "середній_пріоритет"]:
+        df[f"{col}_imputed"] = df[col].isna()
         global_median = df[col].median()
         df[col] = df[col].fillna(global_median)
 
@@ -284,6 +287,109 @@ def bootstrap_beta1(df: pd.DataFrame, spec_cols: list, n_boot: int = N_BOOT, non
             pass
 
     return np.array(betas)
+
+
+# ─────────────────────────────────────────────
+# 3b. SCORE-РЕГРЕСІЯ (бал ~ ціна)
+# ─────────────────────────────────────────────
+
+def _prep_score_df(df: pd.DataFrame, score_col: str) -> pd.DataFrame:
+    """Викинути NaN у балі + рядки з імпутованим балом (якщо такий прапор є)."""
+    out = df.dropna(subset=[score_col]).copy()
+    flag = f"{score_col}_imputed"
+    if flag in out.columns:
+        out = out[~out[flag]].copy()
+    return out
+
+
+def fit_score_model(df: pd.DataFrame, score_col: str = "рейт_бал_контракт",
+                    nonlinear: bool = True):
+    """
+    Регресія: score ~ log(price) + spec_FE  (HC3 SE)
+
+    nonlinear=True (default, log-price): β = на 1% ціни — Δ балу абсолютний
+    nonlinear=False (linear price):       β = на 1 грн ціни — Δ балу
+
+    Інтерпретація: peer-кореляція ціна↔якість абітурієнтів, не каузальний ефект.
+    """
+    df_s = _prep_score_df(df, score_col)
+    if len(df_s) < 20:
+        raise ValueError(f"Мало рядків для score-регресії: {len(df_s)}")
+
+    spec_dummies = pd.get_dummies(
+        df_s["spec_group"], drop_first=True, prefix="s"
+    ).astype(float)
+    spec_cols = spec_dummies.columns.tolist()
+
+    if nonlinear:
+        price_col = np.log(df_s["price_2026"].clip(lower=1))
+        param_key = "log_price"
+    else:
+        price_col = df_s["price_2026"]
+        param_key = "price_2026"
+
+    price_series = pd.Series(price_col.values, index=df_s.index, name=param_key)
+    y = df_s[score_col].astype(float)
+
+    X = pd.concat([price_series, spec_dummies], axis=1)
+    X = sm.add_constant(X)
+
+    model = sm.OLS(y, X).fit(cov_type="HC3")
+    return model, model.params[param_key], spec_cols, model.pvalues[param_key], len(df_s)
+
+
+def bootstrap_beta_score(df: pd.DataFrame, spec_cols: list, score_col: str,
+                         n_boot: int = N_BOOT, nonlinear: bool = True) -> np.ndarray:
+    np.random.seed(SEED)
+    df_s = _prep_score_df(df, score_col)
+    n = len(df_s)
+    param_key = "log_price" if nonlinear else "price_2026"
+
+    betas = []
+    for _ in range(n_boot):
+        idx  = np.random.choice(n, n, replace=True)
+        dfsb = df_s.iloc[idx].copy()
+        sd   = pd.get_dummies(dfsb["spec_group"], drop_first=True, prefix="s").astype(float)
+        for c in spec_cols:
+            if c not in sd.columns:
+                sd[c] = 0.0
+
+        if nonlinear:
+            price_s = pd.Series(np.log(dfsb["price_2026"].clip(lower=1).values),
+                                index=dfsb.index, name="log_price")
+        else:
+            price_s = dfsb["price_2026"].rename("price_2026")
+
+        Xb = pd.concat([price_s, sd[spec_cols]], axis=1)
+        Xb = sm.add_constant(Xb)
+        try:
+            b = sm.OLS(dfsb[score_col].astype(float), Xb).fit().params.get(param_key, np.nan)
+            if pd.notna(b):
+                betas.append(b)
+        except Exception:
+            pass
+
+    return np.array(betas)
+
+
+def score_from_price(p, p_cur: float, score_cur: float,
+                     beta_score: float, nonlinear: bool = True) -> float:
+    """Anchored у точці KSE: бал при ціні p."""
+    p = np.asarray(p, dtype=float)
+    if nonlinear:
+        return score_cur + beta_score * (np.log(np.clip(p, 1, None)) - np.log(max(p_cur, 1)))
+    return score_cur + beta_score * (p - p_cur)
+
+
+def price_from_score(target_score: float, p_cur: float, score_cur: float,
+                     beta_score: float, nonlinear: bool = True) -> float:
+    """Інверсія: ціна що дає цільовий бал. Anchored у точці KSE."""
+    if abs(beta_score) < 1e-12:
+        return float("nan")
+    delta = target_score - score_cur
+    if nonlinear:
+        return p_cur * float(np.exp(delta / beta_score))
+    return p_cur + delta / beta_score
 
 
 # ─────────────────────────────────────────────

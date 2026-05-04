@@ -5,7 +5,7 @@ KSE Pricing Optimizer — Streamlit UI  (light theme)
 Запуск:  streamlit run kse_pricing_app.py
 """
 
-import os, tempfile, warnings
+import os, warnings
 warnings.filterwarnings("ignore")
 
 import numpy as np
@@ -15,6 +15,8 @@ import streamlit as st
 from kse_pricing import (
     load_and_clean, fit_global_ols, bootstrap_beta1,
     compute_rho_cascade, optimize_program,
+    fit_score_model, bootstrap_beta_score,
+    score_from_price,
     UAH_PER_USD, CPI_TO_2026,
 )
 
@@ -40,6 +42,32 @@ def apply_filters(df, years_sel, included_uni_substrings):
             keep |= df["університет_назва"].str.contains(s, case=False)
         df = df[is_kse | (~is_kse & keep)].copy()
     return df
+
+
+def run_score_pipeline(df, score_col, n_boot, nonlinear=True):
+    """
+    Окрема пайплайн для score-регресії: бал ~ log(price) + spec_FE.
+    Повертає dict з beta, CI bootstrap, p-value, N, або None якщо мало даних.
+    """
+    try:
+        m, beta, spec_cols, p_val, n = fit_score_model(df, score_col, nonlinear=nonlinear)
+    except (ValueError, KeyError):
+        return None
+
+    boot = bootstrap_beta_score(df, spec_cols, score_col, n_boot=n_boot, nonlinear=nonlinear)
+    if len(boot) == 0:
+        return None
+    b10, b50, b90 = np.percentile(boot, [10, 50, 90])
+    return {
+        "score_col":  score_col,
+        "beta":       float(beta),
+        "p_val":      float(p_val),
+        "adj_r2":     float(m.rsquared_adj),
+        "n":          int(n),
+        "boot":       boot,
+        "ci":         (float(b10), float(b50), float(b90)),
+        "nonlinear":  nonlinear,
+    }
 
 
 def run_model(df, MC, kse_year, n_boot, rho_year_only=False, nonlinear=False):
@@ -76,6 +104,14 @@ def run_model(df, MC, kse_year, n_boot, rho_year_only=False, nonlinear=False):
                                len(peer_spec), peer_spec["університет_назва"].nunique(),
                                nonlinear=nonlinear)
         res["hist_fp"] = hist_fp.get(row["освітня_програма"], {})
+        # Anchored значення для score-моделі (можуть бути NaN)
+        res["score_cur_рейт"] = float(row["рейт_бал_контракт"]) if pd.notna(row.get("рейт_бал_контракт")) else float("nan")
+        res["score_cur_зно"]  = float(row["зно_бал_контракт"])  if pd.notna(row.get("зно_бал_контракт"))  else float("nan")
+        res["рейт_imputed"]   = bool(row.get("рейт_бал_контракт_imputed", False))
+        # Apps_cur у грн 2026 для перерахунку прибутку при довільній ціні
+        res["_apps_cur"]      = float(row["apps"])
+        res["_p_cur"]         = float(row["price_2026"])
+        res["_rho"]           = float(rho)
         # profit_fact_M — прибуток 2025 на реальних даних (контекст)
         res["profit_fact_M"] = round((res["p_cur_k"] * 1000 - MC) * res["fp_actual_2025"] / 1e6, 3)
         # Головне порівняння: оптимум 2026 vs базовий 2026 (ціна не змінюється)
@@ -150,19 +186,9 @@ section[data-testid="stSidebar"]  { background: #ffffff; border-right: 1px solid
 # SIDEBAR
 # ─────────────────────────────────────────────────────────────
 
+DEFAULT_CSV = os.path.join(os.path.dirname(__file__), "vstup_22-25.csv")
+
 with st.sidebar:
-    st.markdown("### 📁 Дані")
-    uploaded = st.file_uploader("CSV (vstup_*.csv)", type=["csv"], label_visibility="collapsed")
-
-    # Дефолтний файл — якщо нічого не завантажено, шукаємо vstup_22-25.csv поруч
-    DEFAULT_CSV = os.path.join(os.path.dirname(__file__), "vstup_22-25.csv")
-    if uploaded is None:
-        if os.path.exists(DEFAULT_CSV):
-            st.caption(f"📂 Використовується: vstup_22-25.csv")
-        else:
-            st.caption("⚠ vstup_22-25.csv не знайдено поруч зі скриптом")
-
-    st.markdown("---")
     st.markdown("### ⚙️ Параметри моделі")
     mc_usd   = st.number_input("MC (маржинальні витрати), USD", 0, 20000, 2000, 100)
     mc_uah   = mc_usd * UAH_PER_USD
@@ -208,40 +234,58 @@ st.markdown("<p style='color:#6b7280;margin-top:-12px;font-size:14px;'>"
             "OLS demand estimation · anchored profit-max · bootstrap CI</p>",
             unsafe_allow_html=True)
 
-if not uploaded and not os.path.exists(DEFAULT_CSV):
-    st.info("⬅ Завантажте CSV у sidebar або покладіть vstup_22-25.csv поруч зі скриптом")
+if not os.path.exists(DEFAULT_CSV):
+    st.error(f"⚠ Файл `{os.path.basename(DEFAULT_CSV)}` не знайдено поруч зі скриптом.")
     st.stop()
 
-if not run_btn:
+SCORE_METRIC = "рейт_бал_контракт"  # фактичний фільтр вступу
+
+if run_btn:
+    with st.spinner("Завантаження та очищення даних..."):
+        df_full = load_and_clean(DEFAULT_CSV)
+        df_run = apply_filters(
+            df_full,
+            years_sel if set(years_sel) != set(years_all) else None,
+            inc_subs  if len(inc_subs) < len(UNI_LABELS) else None,
+        )
+
+    with st.spinner(f"Регресія попиту + bootstrap ({n_boot} ітерацій)..."):
+        results_run, reg_run = run_model(df_run, mc_uah, kse_year, n_boot, rho_year_only, nonlinear)
+
+    if results_run is None:
+        st.error(f"Немає KSE-програм для {kse_year} у відфільтрованих даних.")
+        st.stop()
+
+    with st.spinner(f"Регресія балу ({SCORE_METRIC}) + bootstrap..."):
+        score_run = run_score_pipeline(df_run, SCORE_METRIC, n_boot=n_boot, nonlinear=True)
+
+    st.session_state["computed"]   = True
+    st.session_state["df"]         = df_run
+    st.session_state["results"]    = results_run
+    st.session_state["reg"]        = reg_run
+    st.session_state["score_info"] = score_run
+    st.session_state["params"]     = {
+        "mc_uah": mc_uah, "kse_year": kse_year, "n_boot": n_boot,
+        "nonlinear": nonlinear,
+    }
+
+if not st.session_state.get("computed"):
     st.markdown("<p style='color:#9ca3af'>Налаштуйте параметри і натисніть **▶ Запустити**</p>",
                 unsafe_allow_html=True)
     st.stop()
 
-
-# ─────────────────────────────────────────────────────────────
-# RUN
-# ─────────────────────────────────────────────────────────────
-
-with st.spinner("Завантаження та очищення даних..."):
-    if uploaded is not None:
-        with tempfile.NamedTemporaryFile(suffix=".csv", delete=False) as tmp:
-            tmp.write(uploaded.read())
-            tmp_path = tmp.name
-    else:
-        tmp_path = DEFAULT_CSV
-    df_full = load_and_clean(tmp_path)
-    df = apply_filters(
-        df_full,
-        years_sel if set(years_sel) != set(years_all) else None,
-        inc_subs  if len(inc_subs) < len(UNI_LABELS) else None,
-    )
-
-with st.spinner(f"Регресія + bootstrap ({n_boot} ітерацій)..."):
-    results, reg = run_model(df, mc_uah, kse_year, n_boot, rho_year_only, nonlinear)
-
-if results is None:
-    st.error(f"Немає KSE-програм для {kse_year} у відфільтрованих даних.")
-    st.stop()
+# Дістати з session_state — далі використовуємо ТІЛЬКИ ці значення.
+# (Зміна параметрів у sidebar не оновлює відображення доки не натиснуто Запустити.)
+df          = st.session_state["df"]
+results     = st.session_state["results"]
+reg         = st.session_state["reg"]
+score_info  = st.session_state["score_info"]
+_params     = st.session_state["params"]
+mc_uah      = _params["mc_uah"]
+kse_year    = _params["kse_year"]
+n_boot      = _params["n_boot"]
+nonlinear   = _params["nonlinear"]
+score_metric = SCORE_METRIC
 
 # ─────────────────────────────────────────────────────────────
 # БЛОК 1 — ТАБЛИЦЯ РЕЗУЛЬТАТІВ
@@ -251,38 +295,57 @@ st.markdown("---")
 st.markdown("## 1 · Результати")
 
 
-rows = [{
-    "Програма":         r["Програма"],
-    "p_факт_k":         r["p_fact_k"],
-    "p_cur_k":          r["p_cur_k"],
-    "p_opt_k":          r["p_opt_k"],
-    "Δp%":              r["delta_p_pct"],
-    "fp_факт_25":       r["fp_actual_2025"],
-    "fp_2026_без_змін": r["fp_model_base"],
-    "fp_2026_opt":      r["fp_opt"],
-    "CI_p10":           r["ci10_k"],
-    "CI_p90":           r["ci90_k"],
-    "ε_попит":          r["eps"],
-    "profit_2026_base": r["profit_base_M"],
-    "profit_2026_opt":  r["profit_opt_M"],
-    "Δprofit%_2026":    r["delta_profit_vs_base"],
-    "profit_факт_25":   r["profit_fact_M"],
-    "peers":            f"{r['peer_rows']}/{r['peer_unis']}",
-    "CI_width%":        r["ci_width_pct"],
-    "status":           r["status"],
-} for r in results]
+# Прогноз балу при p_opt (anchored у KSE точці) + bootstrap CI
+def _predict_score(p_uah: float, r: dict):
+    """Повертає (point, ci_lo, ci_hi) у балах. NaN якщо score-модель недоступна."""
+    if score_info is None:
+        return float("nan"), float("nan"), float("nan")
+    s_cur = r.get("score_cur_рейт", float("nan"))
+    if not (np.isfinite(s_cur) and np.isfinite(p_uah)):
+        return float("nan"), float("nan"), float("nan")
+    p_cur = r["_p_cur"]
+    point = score_from_price(p_uah, p_cur, s_cur, score_info["beta"], nonlinear=True)
+    boot_vals = [score_from_price(p_uah, p_cur, s_cur, b, nonlinear=True)
+                 for b in score_info["boot"]]
+    lo, hi = np.percentile(boot_vals, [10, 90])
+    return float(point), float(lo), float(hi)
+
+
+rows = []
+for r in results:
+    s_at_opt, s_at_opt_lo, s_at_opt_hi = _predict_score(r["p_opt_k"] * 1000, r)
+    s_cur_val = r.get("score_cur_рейт", float("nan"))
+    rows.append({
+        "Програма":         r["Програма"],
+        "p_факт_k":         r["p_fact_k"],
+        "p_cur_k":          r["p_cur_k"],
+        "p_opt_k":          r["p_opt_k"],
+        "Δp%":              r["delta_p_pct"],
+        "бал_KSE":          round(s_cur_val, 1) if np.isfinite(s_cur_val) else float("nan"),
+        "бал@p_opt":        round(s_at_opt, 1) if np.isfinite(s_at_opt) else float("nan"),
+        "бал_CI":           (f"[{s_at_opt_lo:.1f}, {s_at_opt_hi:.1f}]"
+                             if np.isfinite(s_at_opt_lo) else "—"),
+        "fp_факт_25":       r["fp_actual_2025"],
+        "fp_2026_без_змін": r["fp_model_base"],
+        "fp_2026_opt":      r["fp_opt"],
+        "CI_p10":           r["ci10_k"],
+        "CI_p90":           r["ci90_k"],
+        "ε_попит":          r["eps"],
+        "profit_2026_base": r["profit_base_M"],
+        "profit_2026_opt":  r["profit_opt_M"],
+        "Δprofit%_2026":    r["delta_profit_vs_base"],
+        "profit_факт_25":   r["profit_fact_M"],
+        "peers":            f"{r['peer_rows']}/{r['peer_unis']}",
+        "CI_width%":        r["ci_width_pct"],
+    })
 
 df_res = pd.DataFrame(rows)
 
 def _style(df):
-    def col_status(v):
-        return ("background:#dcfce7;color:#166534" if v == "PUBLISH"
-                else "background:#fef3c7;color:#92400e")
     def col_num(v):
         if pd.isna(v): return ""
         return "color:#16a34a;font-weight:600" if v > 0 else "color:#dc2626;font-weight:600"
     return (df.style
-            .map(col_status, subset=["status"])
             .map(col_num, subset=["Δp%", "Δprofit%_2026"])
             .format({
                 "p_факт_k": "{:.1f}k", "p_cur_k": "{:.1f}k", "p_opt_k": "{:.1f}k",
@@ -290,6 +353,7 @@ def _style(df):
                 "Δp%": "{:+.1f}%",     "Δprofit%_2026": "{:+.1f}%",
                 "fp_2026_без_змін": "{:.1f}", "fp_2026_opt": "{:.1f}",
                 "ε_попит": "{:.2f}",   "CI_width%": "{:.1f}%",
+                "бал_KSE": "{:.1f}",   "бал@p_opt": "{:.1f}",
                 "profit_2026_base": "{:.3f}M", "profit_2026_opt": "{:.3f}M",
                 "profit_факт_25": "{:.3f}M",
             }, na_rep="—"))
@@ -297,7 +361,7 @@ def _style(df):
 st.dataframe(_style(df_res), use_container_width=True, height=370)
 
 base_total  = sum(r["profit_base_M"] for r in results)
-opt_total   = sum(r["profit_opt_M"] if r["status"] == "PUBLISH" else r["profit_base_M"] for r in results)
+opt_total   = sum(r["profit_opt_M"] for r in results)
 fact_total  = sum(r["profit_fact_M"] for r in results)
 delta_2026  = (opt_total / base_total - 1) * 100 if base_total else 0
 
@@ -318,7 +382,7 @@ for col, lbl, val, sub in [
      f"(p_cur − MC) × apps × ρ  |  факт 2025: {fact_total:.2f}M грн"),
     (s2, "2026 · оптимальна ціна",
      f"{opt_total:.2f}M грн",
-     "тільки PUBLISH програми"),
+     "усі програми"),
     (s3, "Δ profit  (opt vs без змін)",
      f"{delta_2026:+.1f}%",
      f"{opt_total:.2f}M − {base_total:.2f}M = {opt_total - base_total:+.2f}M грн"),
@@ -369,11 +433,8 @@ COL_DEFS = [
      "Кількість спостережень для ідентифікації нахилу β₁. Мало → нахил оцінений переважно на одному унів.",
      "count(peer rows з тим самим spec_group)"),
     ("CI_width%",     "Ширина CI відносно p_cur",
-     "Якщо > 30% → SKIP. Відображає невизначеність β₁ у bootstrap.",
+     "Відображає невизначеність β₁ у bootstrap. >30% — рекомендація нестабільна, але показуємо все одно.",
      "(CI_p90 − CI_p10) / p_cur × 100"),
-    ("status",        "Статус рекомендації",
-     "PUBLISH = надійна рекомендація. SKIP (edge hit) = оптимум на межі гриду (±5% від краю) — лінійна екстраполяція вийшла за розумні межі. SKIP (unstable CI) = CI_width > 30%.",
-     "edge_hit (5% від краю гриду)  OR  CI_width > 30%"),
 ]
 
 lc, rc = st.columns(2)
@@ -451,6 +512,50 @@ for col, lbl, val, sub in [
     col.markdown(f'<div class="mc"><div class="mc-label">{lbl}</div>'
                  f'<div class="mc-val">{val}</div>'
                  f'<div class="mc-sub">{sub}</div></div>', unsafe_allow_html=True)
+
+
+# ── Регресія балу: score ~ log(price) + spec_FE ─────────────────
+st.markdown("---")
+st.markdown(f"### Регресія балу — `{score_metric}`")
+st.caption(
+    "score ~ log(price) + spec_FE  (HC3 SE) · "
+    "β інтерпретується: на +1% ціни → Δ балу абсолютний (β·log(1.01) ≈ β/100)"
+)
+
+if score_info is None:
+    st.markdown(
+        '<div class="warn">⚠ Score-регресія не побудована — мало рядків з не-NaN '
+        f'<code>{score_metric}</code>.</div>',
+        unsafe_allow_html=True,
+    )
+else:
+    s10, _, s90 = score_info["ci"]
+    p_ok      = score_info["p_val"] < 0.10
+    ci_cross0 = s10 < 0 < s90
+    sig_note  = "✓ p < 0.10" if p_ok else "⚠ p ≥ 0.10 — статистично слабко"
+    ci_note   = "⚠ CI перетинає 0" if ci_cross0 else "✓ CI не перетинає 0"
+
+    sc1, sc2, sc3, sc4 = st.columns(4)
+    for col, lbl, val, sub in [
+        (sc1, "β_score (log-price)",
+              f"{score_info['beta']:.3f}",
+              f"+1% ціни → {score_info['beta']/100:+.3f} балу"),
+        (sc2, "Adj. R²",           f"{score_info['adj_r2']:.3f}",  f"N = {score_info['n']}"),
+        (sc3, "p-value",           f"{score_info['p_val']:.4f}",   sig_note),
+        (sc4, "Bootstrap CI β",    f"[{s10:.2f}, {s90:.2f}]",      ci_note),
+    ]:
+        col.markdown(f'<div class="mc"><div class="mc-label">{lbl}</div>'
+                     f'<div class="mc-val">{val}</div>'
+                     f'<div class="mc-sub">{sub}</div></div>', unsafe_allow_html=True)
+
+    if not p_ok or ci_cross0:
+        st.markdown(
+            '<div class="warn">'
+            '<b>Інтерпретація:</b> зв\'язок ціна↔бал у peer-сеті статистично слабкий. '
+            'Слайдер «бал → ціна» нижче дає <i>описовий</i> сигнал у напрямі поточної кореляції, '
+            'не каузальний прогноз. Не використовувати як єдину підставу для зміни прайсу.'
+            '</div>', unsafe_allow_html=True,
+        )
 
 
 # ─────────────────────────────────────────────────────────────
@@ -555,8 +660,6 @@ st.markdown("---")
 st.markdown("## 6 · Деталі по кожній програмі")
 
 for r in results:
-    tag = '<span class="pub">PUBLISH</span>' if r["status"] == "PUBLISH" \
-          else f'<span class="skip">{r["status"]}</span>'
     label = f"{r['Програма']}  ·  {r['p_fact_k']}k → {r['p_opt_k']}k  ({r['delta_p_pct']:+.1f}%)"
 
     with st.expander(label, expanded=False):
@@ -568,7 +671,7 @@ for r in results:
         ci_c  = "✓ стабільна" if r["ci_width_pct"] <= 30 else "⚠ нестабільна"
 
         st.markdown(f"""
-**Статус:** {tag} &nbsp;|&nbsp; **Spec group:** `{r['spec_group']}` &nbsp;|&nbsp; **Peers:** {r['peer_rows']} рядків / {r['peer_unis']} унів
+**Spec group:** `{r['spec_group']}` &nbsp;|&nbsp; **Peers:** {r['peer_rows']} рядків / {r['peer_unis']} унів
 
 ---
 **Ціна**
@@ -593,9 +696,46 @@ for r in results:
 | При p* (оптимум) | **{r['profit_opt_M']:.3f}M** |
 | Δ vs факт | **{r['delta_profit_vs_fact']:+.1f}%** |
 
-**ε_попит = {r['eps']}** — {eps_c}  
+**ε_попит = {r['eps']}** — {eps_c}
 **ρ = {r['rho_allyears']}** — конверсія заяв у платників (all-years KSE)
 """, unsafe_allow_html=True)
+
+        # ── Прогноз балу при p_opt ──────────────────────────
+        st.markdown("---")
+        st.markdown(f"**Прогноз балу при оптимальній ціні** — `{score_metric}`")
+
+        score_cur = r.get("score_cur_рейт", float("nan"))
+
+        if score_info is None:
+            st.caption("⚠ Score-регресія недоступна (мало даних).")
+        elif not np.isfinite(score_cur):
+            st.caption(f"⚠ KSE-рядок не має `{score_metric}` для {kse_year} — anchor невідомий.")
+        else:
+            beta_score = score_info["beta"]
+            boot_score = score_info["boot"]
+            p_cur_uah  = r["_p_cur"]
+            p_opt_uah  = r["p_opt_k"] * 1000.0
+
+            score_at_opt = score_from_price(p_opt_uah, p_cur_uah, score_cur,
+                                            beta_score, nonlinear=True)
+            boot_scores_at_opt = [
+                score_from_price(p_opt_uah, p_cur_uah, score_cur, b, True)
+                for b in boot_score
+            ]
+            score_opt_lo, score_opt_hi = np.percentile(boot_scores_at_opt, [10, 90])
+            delta_score_pred = score_at_opt - score_cur
+
+            st.markdown(
+                f"""
+| | бал |
+|---|---|
+| Поточний (KSE {kse_year}) | **{score_cur:.2f}** |
+| При p_opt = {r['p_opt_k']}k | **{score_at_opt:.2f}** _(Δ {delta_score_pred:+.2f})_ |
+| Bootstrap CI | [{score_opt_lo:.2f} – {score_opt_hi:.2f}] |
+
+_Anchored у точці KSE ({r['p_cur_k']}k, {score_cur:.2f}) · spec-FE slope з peer-сету._
+                """
+            )
 
 
 st.markdown("---")
