@@ -50,7 +50,7 @@ def run_model(df, MC, kse_year, n_boot, rho_year_only=False, nonlinear=False):
     boot_betas = bootstrap_beta1(df, spec_cols, n_boot=n_boot, nonlinear=nonlinear)
     b10, b50, b90 = np.percentile(boot_betas, [10, 50, 90])
 
-    rho_by_spec, overall_rho = compute_rho_cascade(kse_all, kse_year=kse_year, year_only=rho_year_only)
+    rho_by_prog, rho_by_spec, overall_rho = compute_rho_cascade(kse_all, kse_year=kse_year, year_only=rho_year_only)
 
 
 
@@ -69,7 +69,8 @@ def run_model(df, MC, kse_year, n_boot, rho_year_only=False, nonlinear=False):
     results = []
     for _, row in kse_target.iterrows():
         spec = row["spec_group"]
-        rho  = rho_by_spec.get(spec, overall_rho)
+        prog = row["освітня_програма"]
+        rho  = rho_by_prog.get(prog, rho_by_spec.get(spec, overall_rho))
         peer_spec = peer_all[peer_all["spec_group"] == spec]
         res = optimize_program(row, beta1, boot_betas, rho, MC,
                                len(peer_spec), peer_spec["університет_назва"].nunique(),
@@ -596,6 +597,49 @@ for r in results:
 **ρ = {r['rho_allyears']}** — конверсія заяв у платників (all-years KSE)
 """, unsafe_allow_html=True)
 
+
+st.markdown("---")
+
+# ── ρ по програмах і роках ──────────────────────────────────────
+st.subheader("ρ — конверсія заяв → платники по програмах KSE")
+st.caption("зараховано_платно / всього_заяв · лише KSE · all-years")
+
+_kse_raw = df[df["університет_назва"].str.contains("Київська школа", na=False)].copy()
+_kse_raw["fullpay_plt"] = _kse_raw["зараховано_платно"].fillna(0)
+_kse_raw["apps_"]       = _kse_raw["всього_заяв"].fillna(0)
+_kse_raw["rho_"]        = (_kse_raw["fullpay_plt"] / _kse_raw["apps_"]).round(3)
+
+_pivot = (
+    _kse_raw
+    .pivot_table(index="освітня_програма", columns="рік",
+                 values="rho_", aggfunc="first")
+    .sort_index()
+)
+_pivot.columns = [str(c) for c in _pivot.columns]
+_pivot.index.name = "Програма"
+
+# Кумулятивне ρ (all-years) як остання колонка
+_cum = (
+    _kse_raw.groupby("освітня_програма")
+    .apply(lambda g: g["fullpay_plt"].sum() / g["apps_"].sum())
+    .round(3)
+    .rename("Σ all-years")
+)
+_pivot = _pivot.join(_cum)
+
+def _color_rho(val):
+    if pd.isna(val):
+        return "color: #d1d5db"
+    if val >= 0.20:
+        return "background-color: #dcfce7; color: #166534"
+    if val >= 0.10:
+        return "background-color: #fef9c3; color: #854d0e"
+    return "background-color: #fee2e2; color: #991b1b"
+
+st.dataframe(
+    _pivot.style.applymap(_color_rho).format("{:.3f}", na_rep="—"),
+    use_container_width=True,
+)
 
 st.markdown("---")
 st.markdown("<p style='color:#9ca3af;font-size:11px;text-align:center'>"

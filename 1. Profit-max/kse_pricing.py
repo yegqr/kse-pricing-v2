@@ -294,6 +294,11 @@ def compute_rho_cascade(kse_all: pd.DataFrame, kse_year: int = 2025, year_only: 
     """
     year_only=False (default): ρ по всіх роках KSE — консервативна оцінка.
     year_only=True:            ρ тільки з kse_year — реальна конверсія того сезону.
+
+    Повертає три об'єкти:
+      rho_by_prog  — ρ по освітня_програма (гранулярно, для KSE-оптимізації)
+      rho_by_spec  — ρ по spec_group (fallback якщо програма нова/відсутня)
+      overall_rho  — загальний fallback
     """
     source = kse_all[kse_all["рік"] == kse_year] if year_only else kse_all
 
@@ -306,7 +311,14 @@ def compute_rho_cascade(kse_all: pd.DataFrame, kse_year: int = 2025, year_only: 
         else:
             rho_by_spec[spec] = overall_rho
 
-    return rho_by_spec, overall_rho
+    rho_by_prog = {}
+    for prog, grp in source.groupby("освітня_програма"):
+        if grp["apps"].sum() > 0:
+            rho_by_prog[prog] = grp["fullpay"].sum() / grp["apps"].sum()
+        else:
+            rho_by_prog[prog] = overall_rho
+
+    return rho_by_prog, rho_by_spec, overall_rho
 
 # ─────────────────────────────────────────────
 # 5. ОПТИМІЗАЦІЯ ПО ПРОГРАМІ
@@ -534,12 +546,12 @@ def main():
     print(f"  Bootstrap β₁: [{b10:.7f},  {b90:.7f}]  (median={b50:.7f})")
 
     # 4. ρ (all-years KSE)
-    rho_by_spec, overall_rho = compute_rho_cascade(kse_all, kse_year=kse_year)
+    rho_by_prog, rho_by_spec, overall_rho = compute_rho_cascade(kse_all, kse_year=args.kse_year)
 
-
-
-
-    print(f"\n── ρ ALL-YEARS KSE ───────────────────────────────────────────")
+    print(f"\n── ρ ALL-YEARS KSE (по програмі) ────────────────────────────")
+    for p, r in sorted(rho_by_prog.items()):
+        print(f"  {p:<45} ρ = {r:.3f}")
+    print(f"\n── ρ ALL-YEARS KSE (по spec_group, fallback) ────────────────")
     for s, r in sorted(rho_by_spec.items()):
         print(f"  {s:<45} ρ = {r:.3f}")
     print(f"  {'[overall fallback]':<45} ρ = {overall_rho:.3f}")
@@ -561,7 +573,8 @@ def main():
     results = []
     for _, row in kse25.iterrows():
         spec = row["spec_group"]
-        rho  = rho_by_spec.get(spec, overall_rho)
+        prog = row["освітня_програма"]
+        rho  = rho_by_prog.get(prog, rho_by_spec.get(spec, overall_rho))
 
         peer_spec = peer_all[peer_all["spec_group"] == spec]
         peer_rows = len(peer_spec)
